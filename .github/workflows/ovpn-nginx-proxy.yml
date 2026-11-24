@@ -1,0 +1,107 @@
+name: ovpn-nginx-proxy
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Proxy koto minute cholbe (max 330)"
+        default: "60"
+
+env:
+  TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+  NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+  NGROK_DOMAIN: ${{ secrets.NGROK_DOMAIN }}   # jemon: my-name.ngrok-free.app
+  PROXY_USER: proxy
+  PROXY_PASS: proxy
+
+jobs:
+  proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y openvpn nginx curl
+          sudo systemctl stop nginx || true
+          pip install requests
+
+      - name: Bot on + .ovpn file er opekkha
+        run: python bot.py wait_file
+
+      - name: Start OpenVPN
+        run: |
+          sudo openvpn --config /tmp/client.ovpn \
+            --route-nopull --daemon --log /tmp/ovpn.log
+          for i in $(seq 1 40); do
+            ip -4 addr show tun0 >/dev/null 2>&1 && break
+            sleep 1
+          done
+          if ! ip -4 addr show tun0 >/dev/null 2>&1; then
+            curl -s "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+              -d chat_id="$TG_CHAT_ID" -d text="VPN connect hoyni. .ovpn file ta check korun."
+            exit 1
+          fi
+          TUN_IP=$(ip -4 -o addr show tun0 | awk '{print $4}' | cut -d/ -f1)
+          echo "TUN_IP=$TUN_IP" >> $GITHUB_ENV
+          sudo ip route add default dev tun0 table 100
+          sudo ip rule add from "$TUN_IP" table 100
+          VPN_IP=$(curl -s --max-time 15 --interface "$TUN_IP" https://api.ipify.org)
+          echo "VPN_IP=$VPN_IP" >> $GITHUB_ENV
+
+      - name: Start nginx (username/password = proxy)
+        run: |
+          echo "$PROXY_USER:$(openssl passwd -apr1 "$PROXY_PASS")" > /tmp/htpasswd
+          cat > /tmp/nginx.conf <<EOF
+          pid /tmp/nginx.pid;
+          events {}
+          http {
+            access_log off;
+            error_log /tmp/nginx-error.log;
+            server {
+              listen 8080;
+              merge_slashes off;
+              resolver 1.1.1.1 ipv6=off;
+              proxy_bind $TUN_IP;
+              proxy_ssl_server_name on;
+              auth_basic "proxy";
+              auth_basic_user_file /tmp/htpasswd;
+              location ~ "^/proxy/(?<sch>https?)://(?<hst>[^/]+)(?<pth>/.*)?\$" {
+                proxy_pass \$sch://\$hst\$pth\$is_args\$args;
+                proxy_set_header Host \$hst;
+              }
+              location / { return 404; }
+            }
+          }
+          EOF
+          sudo nginx -c /tmp/nginx.conf
+
+      - name: ngrok diye permanent domain
+        run: |
+          curl -fsSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar xz
+          ./ngrok config add-authtoken "$NGROK_AUTHTOKEN"
+          nohup ./ngrok http --url="$NGROK_DOMAIN" 8080 --log=stdout > /tmp/ngrok.log 2>&1 &
+          sleep 8
+          LOCAL=$(curl -s --max-time 15 -u "$PROXY_USER:$PROXY_PASS" "http://127.0.0.1:8080/proxy/http://api.ipify.org")
+          MSG="Proxy ready
+          VPN IP: $VPN_IP
+          Local test IP: $LOCAL
+          URL: https://$NGROK_DOMAIN/proxy/<target-url>
+          Username: $PROXY_USER
+          Password: $PROXY_PASS
+          Test: curl -u $PROXY_USER:$PROXY_PASS https://$NGROK_DOMAIN/proxy/https://api.ipify.org
+          Bondho korte: /stop likhun (ba ${{ inputs.minutes }} minute pore auto bondho)"
+          curl -s "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+            --data-urlencode chat_id="$TG_CHAT_ID" --data-urlencode text="$MSG" >/dev/null
+
+      - name: Chalu rakho (/stop ba somoy shesh porjonto)
+        run: python bot.py wait_stop $(( ${{ inputs.minutes }} * 60 ))
+
+      - name: Notify finish
+        if: always()
+        run: |
+          curl -s "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+            -d chat_id="$TG_CHAT_ID" -d text="Proxy bondho hoye geche." >/dev/null
